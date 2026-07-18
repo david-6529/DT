@@ -28,7 +28,7 @@ function loadDefaultRivalTargets(): string[] {
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
   dryRun: true,
-  auditSafetyBufferSeconds: 3 * 60 * 60, // clear audits with >=3h to spare
+  auditSafetyBufferSeconds: 24 * 60 * 60, // clear a fresh 24h audit immediately
   proactivePay: true,
   prepayEpochs: 1,
   autoUseBribe: false, // never auto-spend bribes; pay taxes to clear audits instead

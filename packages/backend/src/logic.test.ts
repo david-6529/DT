@@ -12,6 +12,8 @@ import {
   canAffordSpend,
   preBoundaryTaxWei,
   cappedAutoPayEpochs,
+  nextReplacementFee,
+  cappedReplacementFees,
   orderBySalt,
 } from "./logic.js";
 
@@ -288,5 +290,28 @@ describe("effectiveTipGwei (what computeFees actually bids)", () => {
     // Offense here has dynamic tip off, so it stays flat at its static tip.
     const offGas = resolveGas(strategy, true);
     expect(effectiveTipGwei(offGas, threeQuarters, full)).toBe(2);
+  });
+});
+
+describe("replacement fee ceilings", () => {
+  const gas = {
+    maxBaseFeeGwei: 100,
+    priorityFeeGwei: 2,
+    dynamicTipEnabled: false,
+    dynamicTipMaxGwei: 50,
+  };
+
+  it("strictly exceeds a 12.5% bump even when the prior fee is divisible by eight", () => {
+    expect(nextReplacementFee(8_000_000_000n)).toBe(9_000_000_001n);
+  });
+
+  it("refuses a replacement above the configured tip or max-fee ceiling", () => {
+    expect(cappedReplacementFees(
+      4_000_000_000n,
+      2_000_000_000n,
+      250_000_000_000n,
+      50_000_000_000n,
+      gas,
+    )).toBeNull();
   });
 });

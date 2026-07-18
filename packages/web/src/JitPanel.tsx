@@ -252,14 +252,13 @@ export function JitPanel({
                 checked={config.preBoundaryPay}
                 onChange={(e) => gasField("preBoundaryPay", e.target.checked)}
               />
-              ⚠ Race into the boundary block (advanced)
+              ⚠ Pre-submit defensive payments at the boundary (advanced)
             </label>
             <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-              Pre-submits the armed JIT payment just before the epoch boundary so it can land in the
-              <b> first block of the epoch</b>, ahead of a batch-auditor — matching the fastest rivals.
-              The amount is computed off-chain for the next epoch and <b>validated by simulating at the
-              boundary instant</b>, so a wrong value is caught before spending gas. Pair with a high tip
-              above. The normal boundary-timed pay still runs as a fallback.
+              Pre-submits one epoch for each owned Citizen that would become auditable at the next
+              boundary, plus any armed JIT payment, so it can compete in the <b>first eligible block</b>.
+              The upcoming amount is <b>validated by simulating at the boundary instant</b>. If it is
+              missed or rejected, the next normal block/poll tick retries from fresh on-chain data.
             </p>
             <div className="row wrap" style={{ gap: 12, alignItems: "flex-end", marginLeft: 24 }}>
               <label className="field" style={{ flex: "1 1 140px" }}>
@@ -282,9 +281,9 @@ export function JitPanel({
               </label>
             </div>
             <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-              The bot uses whichever matches your submission mode. Bundles name their target block, so
-              they can't land early and are dropped (not mined) if they'd revert — pre-submitting earlier
-              is free and gives builders more time, hence the larger mainnet default. Keep it under 12s.
+              The bot uses whichever lead matches your submission mode. Future-valid public transactions wait
+              for the boundary timestamp; mainnet bundles also carry that timestamp as an inclusion floor. Keep
+              both leads under one 12-second slot. The larger mainnet default gives builders more time.
             </p>
           </div>
           <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>

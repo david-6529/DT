@@ -105,21 +105,17 @@ export interface StrategyConfig {
   jitTargetEpoch: number | null;
   /** Specific tokenIds to cover; empty = all owned citizens. */
   jitTokenIds: string[];
-  /** ADVANCED: pre-submit the JIT payment ~preBoundaryLeadMs *before* the target
-   *  epoch boundary so it lands in the FIRST block of the epoch (ahead of a
-   *  batch-auditor), instead of the block after. The value is computed off-chain
-   *  for the upcoming epoch and validated by simulating AT the boundary timestamp,
-   *  so a wrong value is caught before spending gas. Off by default. */
+  /** ADVANCED: pre-submit needed proactive-defense payments, plus any armed JIT
+   *  payment, ~preBoundaryLeadMs before the target epoch boundary. The value is
+   *  computed off-chain for the upcoming epoch and validated by simulating at the
+   *  boundary timestamp. A normal on-chain-estimate tick remains the fallback. */
   preBoundaryPay: boolean;
-  /** How many ms before the target boundary to fire the pre-submit in
-   *  public/local mode (250–8000). Held tight because a public tx that lands in
-   *  the pre-boundary block carries a next-epoch value and overpay-reverts. */
+  /** How many ms before the target boundary to build and simulate the transaction
+   *  in public/local mode (250–8000). Broadcast waits for the boundary timestamp. */
   preBoundaryLeadMs: number;
-  /** Lead used in `mainnet` (bundle) mode (250–11000). Bundles target a specific
-   *  blockNumber, so they can't land in the wrong block, and a bundle that would
-   *  revert is dropped rather than mined — so pre-submitting earlier is free, and
-   *  gives builders more time to weigh it. Keep under a 12s slot so the bundle's
-   *  target block resolves to the boundary block. */
+  /** Lead used in `mainnet` (bundle) mode (250–11000). The bundle carries a
+   *  boundary minTimestamp and its public fallback waits for that timestamp.
+   *  Keep the lead under one 12s slot. */
   preBoundaryLeadMainnetMs: number;
 
   // --- Offense (optional) ---
@@ -175,7 +171,8 @@ export interface StrategyConfig {
   offenseBoundaryScheduling: boolean;
   /** Also broadcast time-critical offense txs to the public mempool alongside
    *  the Flashbots bundle, so any builder can include them in the next block.
-   *  Trades bundle privacy for lower inclusion latency. */
+   *  Trades bundle privacy for lower inclusion latency. Defense/JIT overrides
+   *  this to true so a private offense nonce cannot fence a survival payment. */
   racePublicMempool: boolean;
   /** Scale the priority-fee tip up as the latest block fills, so we stay
    *  competitive for inclusion in contested blocks. When off, the static

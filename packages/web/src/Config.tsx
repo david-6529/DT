@@ -286,7 +286,9 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       </label>
       <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
         Also broadcasts time-critical offense txs to the public mempool alongside the Flashbots bundle,
-        so any builder can include them next block. Trades bundle privacy for speed. No effect in public mode.
+        so any builder can include them next block. Trades bundle privacy for speed. While defense/JIT is
+        active this fallback is always used, so a private offense nonce cannot block an emergency payment.
+        No effect in public mode.
       </p>
 
       {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a

@@ -1,4 +1,4 @@
-import { parseEther, formatEther, type Address } from "viem";
+import { parseEther, formatEther, type Address, type Hex } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
@@ -21,8 +21,16 @@ import {
   fetchCandidateTokenIds,
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
-import { submitTx, beginBundle, flushBundle, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, orderBySalt } from "./logic.js";
+import {
+  submitTx,
+  beginBundle,
+  flushBundle,
+  discardBundle,
+  waitForBundleFallbacks,
+  type TxIntent,
+  type SubmitResult,
+} from "./flashbots.js";
+import { resolveGas, effectiveTipGwei, cappedReplacementFees, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -31,12 +39,37 @@ const GAS_GUESS = 200_000n; // for pre-flight spend-cap checks only
 let timer: NodeJS.Timeout | null = null;
 let boundaryTimer: NodeJS.Timeout | null = null;
 let offenseBoundaryTimer: NodeJS.Timeout | null = null;
-let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryAuditTimer: NodeJS.Timeout | null = null;
 let preBoundaryKillTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
+let engineGeneration = 0;
+let executingGeneration: number | null = null;
+let engineAbortController: AbortController | null = null;
+let idleWaiters: Array<() => void> = [];
+
+function executionIsCurrent(generation: number): boolean {
+  return runtime.running && generation === engineGeneration;
+}
+
+function finishExclusive(generation: number): void {
+  if (executingGeneration === generation) executingGeneration = null;
+  ticking = false;
+  const waiters = idleWaiters;
+  idleWaiters = [];
+  for (const resolve of waiters) resolve();
+  // If a new run started while the old run was winding down, its immediate tick
+  // was intentionally blocked by `ticking`; start it now under the new generation.
+  if (runtime.running && generation !== engineGeneration) void tick(engineGeneration);
+}
+
+export async function waitForEngineIdle(): Promise<void> {
+  if (ticking) {
+    await new Promise<void>((resolve) => idleWaiters.push(resolve));
+  }
+  await waitForBundleFallbacks();
+}
 // Randomized once per engine start (see startEngine) and used to reorder the
 // rival sweep (offensePass, firePreBoundaryAudit, firePreBoundaryKill) so every
 // bot instance doesn't audit/kill candidates in the same identical order — the
@@ -49,16 +82,57 @@ let engineSalt = 0;
 // min-balance floor holds across all spends in a tick, not just each in isolation.
 let committedThisTickWei = 0n;
 
+type PaymentSource = "pre-boundary" | "defense" | "proactive" | "jit";
+
+interface PaymentFlight {
+  attemptId: number;
+  account: Address;
+  tokenId: string;
+  expectedLastEpochPaid: bigint;
+  nonce: number;
+  valueWei: bigint;
+  gasWei: bigint;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  txHash?: Hex;
+  source: PaymentSource;
+  /** Target-scoped obligations carried across same-nonce replacements. */
+  jitTargetEpoch: number | null;
+  proactiveEpoch: bigint | null;
+  proactiveMarkerReserved: boolean;
+  submittedAtMs: number;
+  delivery: "queued" | "submitted" | "included";
+}
+
+interface BatchEntry {
+  entryId: string;
+  nonce: number;
+  message: string;
+  paymentAttemptId?: number;
+  paymentTokenId?: string;
+  previousPaymentFlight?: PaymentFlight;
+}
+
+// One shared guard covers every tax-payment path. The on-chain lastEpochPaid
+// value remains authoritative; this map only prevents a still-pending tx from
+// being duplicated by another pass while that value is necessarily stale.
+const paymentFlights = new Map<string, PaymentFlight>();
+let nextPaymentAttemptId = 0;
+let paymentFlightAccount: Address | null = null;
+
 // Activity entries whose tx was queued into the current bundle batch (mainnet).
-// flushBatch fills in each one's txHash/bundleHash and starts receipt tracking
-// once the whole tick's txs are sent together as one atomic bundle.
-let batchEntries: { entryId: string; nonce: number }[] = [];
+// flushBatch fills in each one's txHash/bundleHash and reconciles provisional
+// payment-flight state once the whole batch has actually been delivered.
+let batchEntries: BatchEntry[] = [];
+let batchOpenedForMainnet = false;
 
 /** Open a bundle batch for a tick so all its txs go out as one atomic multi-tx
- *  bundle (mainnet only; public/local send each tx immediately as before). */
+ *  bundle (mainnet only; public/local submit directly, with future-valid races
+ *  held until their simulated timestamp). */
 function beginBatch(): void {
   batchEntries = [];
-  if (appConfig.mode === "mainnet") beginBundle();
+  batchOpenedForMainnet = appConfig.mode === "mainnet";
+  if (batchOpenedForMainnet) beginBundle();
 }
 
 /** Send the tick's queued txs as one bundle and reconcile each activity entry
@@ -66,23 +140,90 @@ function beginBatch(): void {
 async function flushBatch(): Promise<void> {
   const entries = batchEntries;
   batchEntries = [];
-  if (appConfig.mode !== "mainnet" || entries.length === 0) return;
+  const wasMainnet = batchOpenedForMainnet;
+  batchOpenedForMainnet = false;
+  if (!wasMainnet) return;
+  if (entries.length === 0) {
+    discardBundle("empty batch");
+    return;
+  }
   let results: Awaited<ReturnType<typeof flushBundle>>;
   try {
     results = await flushBundle();
   } catch (err) {
     logger.error("bundle flush error:", (err as Error).message);
+    for (const entry of entries) reconcileFailedBatchEntry(entry, "bundle flush error");
     return;
   }
-  for (const { entryId, nonce } of entries) {
+  for (const entry of entries) {
+    const { entryId, nonce } = entry;
     const r = results.get(nonce);
-    if (!r) continue;
+    if (!r || (!r.ok && !r.uncertain)) {
+      reconcileFailedBatchEntry(entry, r?.error ?? "bundle was not delivered");
+      continue;
+    }
     activity.update(entryId, {
-      status: r.ok ? "submitted" : "skipped",
+      status: "submitted",
       txHash: r.txHash,
       bundleHash: r.bundleHash,
+      message: r.uncertain
+        ? `${entry.message} — delivery was not acknowledged; retaining the nonce and retrying safely`
+        : entry.message,
     });
-    if (r.txHash) void trackReceipt(entryId, r.txHash);
+    const flight = currentBatchPaymentFlight(entry);
+    if (flight) {
+      flight.delivery = "submitted";
+      flight.txHash = r.txHash ?? flight.txHash;
+    }
+    if (r.txHash) void trackReceipt(entryId, r.txHash, flight);
+  }
+}
+
+function discardBatch(reason = "engine stopped before bundle submission"): void {
+  const entries = batchEntries;
+  batchEntries = [];
+  const wasMainnet = batchOpenedForMainnet;
+  batchOpenedForMainnet = false;
+  const results = wasMainnet ? discardBundle(reason) : new Map();
+  for (const entry of entries) {
+    const error = results.get(entry.nonce)?.error ?? reason;
+    reconcileFailedBatchEntry(entry, error);
+  }
+}
+
+async function flushOrDiscardBatch(generation: number): Promise<void> {
+  if (executionIsCurrent(generation)) await flushBatch();
+  else discardBatch();
+}
+
+function currentBatchPaymentFlight(entry: BatchEntry): PaymentFlight | undefined {
+  if (entry.paymentTokenId === undefined || entry.paymentAttemptId === undefined) return undefined;
+  const current = paymentFlights.get(entry.paymentTokenId);
+  return current?.attemptId === entry.paymentAttemptId ? current : undefined;
+}
+
+function clearSourceMarker(flight: PaymentFlight): void {
+  if (flight.proactiveMarkerReserved && proactivePaySubmittedEpoch === flight.proactiveEpoch) {
+    proactivePaySubmitted.delete(flight.tokenId);
+  }
+}
+
+function restoreSourceMarker(flight: PaymentFlight): void {
+  if (flight.proactiveMarkerReserved && proactivePaySubmittedEpoch === flight.proactiveEpoch) {
+    proactivePaySubmitted.add(flight.tokenId);
+  }
+}
+
+function reconcileFailedBatchEntry(entry: BatchEntry, error: string): void {
+  activity.update(entry.entryId, { status: "skipped", message: error });
+  const flight = currentBatchPaymentFlight(entry);
+  if (!flight) return;
+  clearSourceMarker(flight);
+  if (entry.previousPaymentFlight) {
+    paymentFlights.set(flight.tokenId, entry.previousPaymentFlight);
+    restoreSourceMarker(entry.previousPaymentFlight);
+  } else {
+    paymentFlights.delete(flight.tokenId);
   }
 }
 
@@ -94,13 +235,12 @@ async function flushBatch(): Promise<void> {
 /**
  * How early to pre-submit a boundary race, by submission path.
  *
- * public/local: a tx that lands in the block BEFORE the boundary carries a
- *   next-epoch value and overpay-reverts, so the lead is held tight (~3s).
- * mainnet: a bundle names its target `blockNumber`, so it cannot land in the
- *   wrong block, and a bundle that would revert is DROPPED rather than mined —
- *   pre-submitting earlier costs nothing and gives builders more time to weigh
- *   it. Default ~5s, kept under a 12s slot so `currentBlock + 1` still resolves
- *   to the boundary block.
+ * public/local: build and simulate shortly before the boundary, but do not
+ *   broadcast until the simulated timestamp so a prior block cannot consume the
+ *   nonce with an overpayment revert.
+ * mainnet: give builders a little more lead and set minTimestamp on the bundle;
+ *   its public mirror is held to the same boundary timestamp. Keep the lead under
+ *   a 12s slot so the intended target remains the next block in normal timing.
  */
 function effectiveLeadMs(): number {
   const s = runtime.strategy;
@@ -115,13 +255,13 @@ function effectiveLeadMs(): number {
 // immediate-fire branches inside the schedulers keep dropping when nested in a
 // tick, which is what avoids a re-entrant rerun loop.
 const BOUNDARY_RETRY_MS = 250;
-function fireBoundaryTick(fireProactivePay: boolean): void {
-  if (!runtime.running) return;
+function fireBoundaryTick(generation = engineGeneration): void {
+  if (!executionIsCurrent(generation)) return;
   if (ticking) {
-    setTimeout(() => fireBoundaryTick(fireProactivePay), BOUNDARY_RETRY_MS);
+    setTimeout(() => fireBoundaryTick(generation), BOUNDARY_RETRY_MS);
     return;
   }
-  void tick(fireProactivePay);
+  void tick(generation);
 }
 
 // Soonest future audit-expiry (kill deadline) seen in the last offense sweep, in
@@ -137,17 +277,43 @@ export function resetJitState(): void {
   jitSubmittedTarget = null;
 }
 
-// Proactive-pay bookkeeping: tokenIds already submitted for the current epoch.
-// DEFENSE_LEAD_MS's pre-boundary fire converges through a short second re-arm
-// (deltaMs shrinks from ~1.5s to a few hundred ms before finally hitting the
-// immediate-fire branch), which would otherwise call proactivePayPass twice in
-// quick succession — before the first tx has a chance to confirm and clear the
-// "delinquent" classification — and double-submit the same payment.
+function prepareJitBookkeeping(): void {
+  const target = runtime.strategy.jitEnabled ? runtime.strategy.jitTargetEpoch : null;
+  if (target !== null && jitSubmittedTarget !== target) {
+    jitSubmitted = new Set();
+    jitSubmittedTarget = target;
+  }
+}
+
+// Proactive-pay bookkeeping: at most one successfully delivered automatic
+// catch-up payment per token per epoch. The shared flight map handles pending
+// deduplication; this cap prevents a deeply-behind Citizen from being drained by
+// a new one-epoch payment on every 12-second tick.
 let proactivePaySubmittedEpoch: bigint | null = null;
 let proactivePaySubmitted = new Set<string>();
 
+/** Clear run-scoped payment state when the wallet identity changes. Exported so
+ *  the API/tests can make an explicit identity reset; pausing the engine must not
+ *  erase it while transactions may still be pending. */
+export function resetPaymentTracking(): void {
+  paymentFlights.clear();
+  nextPaymentAttemptId = 0;
+  proactivePaySubmittedEpoch = null;
+  proactivePaySubmitted = new Set();
+  paymentFlightAccount = runtime.account?.address ?? null;
+}
+
 export function startEngine(): void {
   if (timer || unwatchBlocks) return;
+  engineGeneration += 1;
+  engineAbortController?.abort();
+  engineAbortController = new AbortController();
+  const accountAddress = runtime.account?.address ?? null;
+  if (paymentFlightAccount !== null && accountAddress !== paymentFlightAccount) {
+    resetPaymentTracking();
+    resetJitState();
+  }
+  paymentFlightAccount = accountAddress;
   engineSalt = Math.floor(Math.random() * 0xffffffff);
   runtime.running = true;
   runtime.emitStatus();
@@ -161,26 +327,33 @@ export function startEngine(): void {
     });
   }
 
+  // Always keep a polling watchdog. WebSocket subscriptions can go quiet after
+  // a provider disconnect without delivering another block or error; `ticking`
+  // safely coalesces watchdog and block-triggered ticks.
+  timer = setInterval(() => void tick(), TICK_MS);
   if (wsClient) {
     // React on every new block (~100-500ms latency vs up to 12s with polling).
     unwatchBlocks = wsClient.watchBlocks({
       onBlock: () => void tick(),
       onError: (err) => logger.warn("Block subscription error:", (err as Error).message),
     });
-    activity.add({ kind: "info", status: "info", message: "Block subscription active (WebSocket)" });
+    activity.add({ kind: "info", status: "info", message: "Block subscription active (WebSocket + 12s polling watchdog)" });
   } else {
-    // Fallback: poll every 12s if no WebSocket URL is configured.
-    timer = setInterval(() => void tick(), TICK_MS);
     activity.add({ kind: "info", status: "info", message: "Polling every 12s (no WebSocket configured)" });
   }
   void tick();
 }
 
 export function stopEngine(): void {
+  // Invalidate every in-progress action before clearing timers. HTTP callers
+  // await waitForEngineIdle(), so "stopped" is not reported while an old batch
+  // can still be flushed afterward.
+  engineGeneration += 1;
+  engineAbortController?.abort();
+  runtime.running = false;
   if (timer) clearInterval(timer);
   if (boundaryTimer) clearTimeout(boundaryTimer);
   if (offenseBoundaryTimer) clearTimeout(offenseBoundaryTimer);
-  if (defenseBoundaryTimer) clearTimeout(defenseBoundaryTimer);
   if (preBoundaryTimer) clearTimeout(preBoundaryTimer);
   if (preBoundaryAuditTimer) clearTimeout(preBoundaryAuditTimer);
   if (preBoundaryKillTimer) clearTimeout(preBoundaryKillTimer);
@@ -188,12 +361,10 @@ export function stopEngine(): void {
   timer = null;
   boundaryTimer = null;
   offenseBoundaryTimer = null;
-  defenseBoundaryTimer = null;
   preBoundaryTimer = null;
   preBoundaryAuditTimer = null;
   preBoundaryKillTimer = null;
   unwatchBlocks = null;
-  runtime.running = false;
   runtime.emitStatus();
   activity.add({ kind: "info", status: "info", message: "Engine paused" });
 }
@@ -217,14 +388,63 @@ export function scheduleJitBoundary(): void {
     return;
   }
   const delayMs = Math.min(deltaSec * 1000 + 500, 2_000_000_000);
-  boundaryTimer = setTimeout(() => fireBoundaryTick(false), delayMs);
+  const generation = engineGeneration;
+  boundaryTimer = setTimeout(() => fireBoundaryTick(generation), delayMs);
+}
+
+interface PreBoundaryPayPlan {
+  targetEpoch: bigint;
+  boundaryTs: bigint;
+  includeJit: boolean;
+  includeProactive: boolean;
+}
+
+function selectedOwnedJitTokenIds(ownedIds: bigint[]): bigint[] {
+  const configured = runtime.strategy.jitTokenIds;
+  if (configured.length === 0) return ownedIds;
+  const ownedById = new Map(ownedIds.map((id) => [id.toString(), id]));
+  return [...new Set(configured)].flatMap((id) => {
+    if (!/^\d+$/.test(id)) return [];
+    const owned = ownedById.get(BigInt(id).toString());
+    return owned === undefined ? [] : [owned];
+  });
+}
+
+/** Pick the next future epoch that needs a pre-boundary payment. In addition to
+ * one-shot JIT, proactive defense recurs every epoch and only pays citizens that
+ * will cross from the one-epoch grace period into auditable delinquency. */
+function preBoundaryPayPlan(): PreBoundaryPayPlan | null {
+  const s = runtime.strategy;
+  const currentEpoch = runtime.currentEpoch;
+  const startTime = runtime.startTime;
+  if (currentEpoch === null || startTime === null) return null;
+
+  const proactiveTarget = s.enabled && s.proactivePay ? currentEpoch + 1n : null;
+  const configuredJitTarget = s.jitEnabled && s.jitTargetEpoch !== null
+    ? BigInt(s.jitTargetEpoch)
+    : null;
+  const jitTarget = configuredJitTarget !== null && configuredJitTarget > currentEpoch
+    ? configuredJitTarget
+    : null;
+  if (proactiveTarget === null && jitTarget === null) return null;
+
+  const targetEpoch = proactiveTarget === null
+    ? jitTarget!
+    : jitTarget === null || proactiveTarget <= jitTarget
+      ? proactiveTarget
+      : jitTarget;
+  return {
+    targetEpoch,
+    boundaryTs: startTime + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS,
+    includeJit: jitTarget === targetEpoch,
+    includeProactive: proactiveTarget === targetEpoch,
+  };
 }
 
 /**
- * ADVANCED (opt-in): arm a pre-submit ~preBoundaryLeadMs BEFORE the armed epoch
- * boundary, so the JIT payment lands in the FIRST block of the epoch (ahead of a
- * batch-auditor) rather than the block after. Requires an off-chain value for the
- * upcoming epoch, validated by simulating AT the boundary timestamp before send.
+ * Arm a pre-submit ~preBoundaryLeadMs before the next defensive payment epoch.
+ * This covers both one-shot JIT and recurring tax-skip defense, and validates the
+ * upcoming-epoch value by simulating at the boundary timestamp before send.
  */
 export function schedulePreBoundaryPay(): void {
   if (preBoundaryTimer) {
@@ -232,74 +452,159 @@ export function schedulePreBoundaryPay(): void {
     preBoundaryTimer = null;
   }
   const s = runtime.strategy;
-  if (!runtime.running || !s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null || runtime.startTime === null) {
+  const plan = preBoundaryPayPlan();
+  if (!runtime.running || !s.preBoundaryPay || plan === null) return;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const deltaMs = Number(plan.boundaryTs - nowSec) * 1000 - effectiveLeadMs();
+  if (deltaMs <= 0) {
+    // Starting or waking inside the configured lead is still useful. Fire now
+    // while the boundary is in the future; public delivery remains held until
+    // the future-valid timestamp. Post-boundary ticks are the fallback.
+    if (nowSec < plan.boundaryTs) {
+      const generation = engineGeneration;
+      preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(plan, generation), 0);
+    }
     return;
   }
-  const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
-  if (deltaMs <= 0) return; // too late to pre-submit; the +500ms JIT tick covers it
-  preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(), Math.min(deltaMs, 2_000_000_000));
+  const maxTimerDelayMs = 2_000_000_000;
+  if (deltaMs > maxTimerDelayMs) {
+    // Node timers cannot safely represent arbitrarily distant dates. Wake only
+    // to recompute from fresh state; never mistake the clamp for the fire time.
+    preBoundaryTimer = setTimeout(schedulePreBoundaryPay, maxTimerDelayMs);
+    return;
+  }
+  // Capture the exact epoch this timer was armed for. Recomputing at callback
+  // time can turn a delayed epoch-N timer into an early epoch-(N+1) payment.
+  const generation = engineGeneration;
+  preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(plan, generation), deltaMs);
 }
 
 // Fixed gas for a pre-boundary payTaxes — we can't eth_estimateGas it (the value
 // is invalid against current state), so pass a generous fixed limit.
 const PRE_BOUNDARY_GAS = 120_000n;
+// Optional offense may ride only while there is still comfortable time to hand
+// the mandatory payment bundle to builders. One audit is enough to preserve the
+// placement optimization without letting a large offense sweep delay survival.
+const PRE_BOUNDARY_DELIVERY_MARGIN_MS = 1_500;
+const MAX_RIDE_AUDITS = 1;
+
+type DeadlineOutcome<T> = { timedOut: false; value: T } | { timedOut: true };
+
+/** Bound read-only optional work by an absolute wall-clock cutoff. The abandoned
+ * promise may finish later, but it cannot reserve a nonce or mutate the batch. */
+async function settleBeforeDeadline<T>(
+  promise: Promise<T>,
+  deadlineMs: number,
+): Promise<DeadlineOutcome<T>> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) return { timedOut: true };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ timedOut: false as const, value })),
+      new Promise<{ timedOut: true }>((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true }), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
- * Fire the opt-in pre-boundary JIT payment: for each armed token still behind on
- * the target epoch, submit payTaxes with a value computed off-chain for that
- * epoch, skipping simulation, aiming to land in the boundary block. Best-effort —
- * it does NOT mark jitSubmitted, so the ordinary +500ms JIT tick (with real
- * simulation + on-chain value) remains the authoritative fallback if a pre-submit
- * reverts or loses the race.
+ * Fire a pre-boundary payment for one-shot JIT tokens and/or owned citizens that
+ * will become auditable in the upcoming epoch. A shared per-token flight prevents
+ * duplicate sends while the normal on-chain-status pass remains authoritative.
  */
-async function firePreBoundaryPay(): Promise<void> {
+async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineGeneration): Promise<void> {
   const s = runtime.strategy;
-  if (!s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null) return;
+  if (!executionIsCurrent(generation)) return;
+  if (!s.preBoundaryPay) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
-  if (runtime.gameState !== 1) return; // only act while the game is LIVE
-  if (ticking) { setTimeout(() => void firePreBoundaryPay(), 150); return; } // don't overlap nonce use
+
+  const includeJit = plan.includeJit
+    && s.jitEnabled
+    && s.jitTargetEpoch !== null
+    && BigInt(s.jitTargetEpoch) === plan.targetEpoch;
+  const includeProactive = plan.includeProactive && s.enabled && s.proactivePay;
+  if (!includeJit && !includeProactive) return;
+  if (includeJit) prepareJitBookkeeping();
+
+  const nowMs = Date.now();
+  const boundaryMs = Number(plan.boundaryTs) * 1000;
+  if (nowMs < boundaryMs - effectiveLeadMs() - 1_000) {
+    schedulePreBoundaryPay();
+    return;
+  }
+  if (nowMs >= boundaryMs) {
+    // The epoch already rolled while this timer was delayed. Let the normal
+    // on-chain estimate path recover; never send a stale or N+1 price here.
+    if (!ticking) void tick();
+    return;
+  }
+  if (ticking) { setTimeout(() => void firePreBoundaryPay(plan, generation), 150); return; } // don't overlap nonce use
   ticking = true;
+  executingGeneration = generation;
   committedThisTickWei = 0n;
   beginBatch();
   const address = runtime.account.address;
-  const targetEpoch = BigInt(s.jitTargetEpoch);
-  // The instant the target epoch begins — we simulate there so the value is
-  // validated against the epoch the tx will actually execute in.
-  const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
+  const { targetEpoch, boundaryTs } = plan;
   try {
-    // Discover audit targets CONCURRENTLY with payment processing — these reads
-    // touch neither the nonce nor the batch, so they don't belong on the payment's
-    // critical path before the bundle flushes. Only the audit *queueing* (which
-    // reserves nonces after the payments) must follow. Never throws (payment-safe).
-    const auditNowSec = BigInt(Math.floor(Date.now() / 1000));
-    const auditPlanPromise = prefetchPreBoundaryAuditTargets(address, targetEpoch, auditNowSec);
+    // Optional offense must never sit on the survival path. In mainnet mode,
+    // start read-only audit discovery alongside the mandatory payment reads, then
+    // attach it only if it has already finished by the time payments are ready.
+    // Public/local mode keeps the standalone audit scheduler instead.
+    let auditPrefetch: { settled: boolean; plan: PreBoundaryAuditPlan | null } | null = null;
+    if (appConfig.mode === "mainnet") {
+      auditPrefetch = { settled: false, plan: null };
+      const state = auditPrefetch;
+      void prefetchPreBoundaryAuditTargets(
+        address,
+        targetEpoch,
+        BigInt(Math.floor(Date.now() / 1000)),
+      ).then((auditPlan) => {
+        state.plan = auditPlan;
+        state.settled = true;
+      });
+    }
 
-    // Nonce sync and owned-token fetch are independent — run together (both must
-    // finish before we reserve nonces / pick selected tokens below).
-    const [, ownedIds] = await Promise.all([
+    // These reads are independent. The fresh snapshot prevents a delayed timer
+    // from signing for the wrong epoch before any nonce is reserved.
+    const [fresh, , ownedIds] = await Promise.all([
+      getGameSnapshot(),
       nonceManager.sync(address, appConfig.mode),
       fetchOwnedTokenIds(runtime.citizensAddress as Address, address),
     ]);
-    const selected = s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds;
-    if (selected.length === 0) {
-      await auditPlanPromise; // let the concurrent prefetch settle (no unhandled rejection)
+    if (fresh.state !== 1 || fresh.currentEpoch + 1n !== targetEpoch) {
+      logger.warn(`skip stale pre-boundary payment timer for epoch ${targetEpoch}; chain is at epoch ${fresh.currentEpoch}`);
       return;
     }
+    const jitIds = includeJit ? selectedOwnedJitTokenIds(ownedIds) : [];
+    const byId = new Map<string, bigint>();
+    if (includeProactive) for (const id of ownedIds) byId.set(id.toString(), id);
+    for (const id of jitIds) byId.set(id.toString(), id);
+    const selected = [...byId.values()];
+
+    const owned = new Set(ownedIds.map((id) => id.toString()));
+    const jit = new Set(jitIds.map((id) => id.toString()));
 
     // One multicall for lastEpochPaid across the selected tokens.
-    const results = await publicClient.multicall({
-      allowFailure: true,
-      contracts: selected.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
-    });
+    const results = selected.length === 0
+      ? []
+      : await publicClient.multicall({
+          allowFailure: true,
+          contracts: selected.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
+        });
     let queuedPayment = false;
     for (let i = 0; i < selected.length; i++) {
       const r = results[i];
       if (r?.status !== "success") continue;
       const lastEpochPaid = r.result as bigint;
-      if (lastEpochPaid >= targetEpoch) continue; // already current for the target
       const key = selected[i]!.toString();
+      const jitDue = includeJit && jit.has(key) && lastEpochPaid < targetEpoch;
+      const proactiveDue = includeProactive && owned.has(key) && lastEpochPaid + 2n <= targetEpoch;
+      if (!jitDue && !proactiveDue) continue;
+      if (pendingPaymentFor(key, lastEpochPaid)) continue;
       // JIT always pays exactly one epoch — one day (targetEpoch * base) — which
       // advances the citizen a single epoch regardless of how far behind it is. So
       // it fires even when the citizen is momentarily 2 behind at the boundary (the
@@ -314,28 +619,41 @@ async function firePreBoundaryPay(): Promise<void> {
       const res = await act(
         { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
         "pay-taxes",
-        { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`, race: true, simTimestamp: boundaryTs },
+        {
+          tokenId: key,
+          message: `Pre-boundary ${jitDue ? "JIT" : "tax-skip"} pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`,
+          race: true,
+          simTimestamp: boundaryTs,
+          payment: {
+            expectedLastEpochPaid: lastEpochPaid + 1n,
+            source: jitDue ? "jit" : "pre-boundary",
+            jitTargetEpoch: jitDue ? Number(targetEpoch) : undefined,
+            proactiveEpoch: proactiveDue ? targetEpoch : undefined,
+          },
+        },
       );
-      if (res?.ok) queuedPayment = true;
+      if (res?.ok && res.queued) queuedPayment = true;
     }
 
-    // Ride any due pre-boundary audits in the SAME atomic bundle, queued AFTER the
-    // payments (higher nonces) and marked allowed-to-revert. They can never drop a
-    // payment (revertingTxHashes) and — when a payment IS present — aren't mirrored
-    // to the mempool, so the wallet's mempool sequence stays a clean single run of
-    // payments and the payment still wins top-of-block. This is the fix for the
-    // two-separate-bundles nonce contention that pushed a payment+audit down into
-    // the mempool region. If no payment was queued (all citizens current), the
-    // audits fall back to standalone behaviour (mirrored) — nothing to protect.
-    const auditPlan = await auditPlanPromise;
-    if (auditPlan) await queueAuditPlan(auditPlan, targetEpoch, boundaryTs, { revertible: queuedPayment });
+    // If read-only discovery already finished with time to spare, ride one audit
+    // behind the payments in the same mainnet bundle. The audit is explicitly
+    // allowed to revert and stays out of the immediate public payment prefix. If
+    // discovery is slow, flush the survival payment without waiting for offense.
+    if (auditPrefetch?.settled && auditPrefetch.plan) {
+      await queueAuditPlan(auditPrefetch.plan, targetEpoch, boundaryTs, {
+        revertible: queuedPayment,
+        deadlineMs: boundaryMs - PRE_BOUNDARY_DELIVERY_MARGIN_MS,
+      });
+    } else if (auditPrefetch && !auditPrefetch.settled) {
+      logger.warn("pre-boundary audit discovery was not ready; submitting payments without optional audits");
+    }
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
   } finally {
-    await flushBatch();
+    await flushOrDiscardBatch(generation);
     nonceManager.reset();
-    ticking = false;
+    finishExclusive(generation);
   }
 }
 
@@ -383,11 +701,11 @@ export function schedulePreBoundaryAudit(): void {
   // the audits inside its atomic bundle (behind the payment, revertible). Don't
   // also fire a standalone audit — that would double-submit and reintroduce the
   // two-bundle nonce contention that demotes the payment.
+  const paymentPlan = preBoundaryPayPlan();
   if (
-    s.preBoundaryPay &&
-    s.jitEnabled &&
-    s.jitTargetEpoch !== null &&
-    BigInt(s.jitTargetEpoch) === runtime.currentEpoch + 1n
+    appConfig.mode === "mainnet"
+    && s.preBoundaryPay
+    && paymentPlan?.targetEpoch === runtime.currentEpoch + 1n
   ) {
     return;
   }
@@ -395,7 +713,11 @@ export function schedulePreBoundaryAudit(): void {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
   if (deltaMs <= 0) return; // too late; normal offense picks it up after the roll
-  preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
+  const generation = engineGeneration;
+  const maxTimerDelayMs = 2_000_000_000;
+  preBoundaryAuditTimer = deltaMs > maxTimerDelayMs
+    ? setTimeout(schedulePreBoundaryAudit, maxTimerDelayMs)
+    : setTimeout(() => void firePreBoundaryAudit(generation), deltaMs);
 }
 
 interface PreBoundaryAuditPlan {
@@ -443,27 +765,42 @@ async function prefetchPreBoundaryAuditTargets(
 /**
  * Queue the audits from a prefetched plan into the CURRENTLY OPEN batch (caller has
  * opened beginBatch and synced the nonce). When `revertible`, each audit is marked
- * allowed-to-revert and is NOT mirrored to the mempool — so it can ride behind a
- * mandatory payment in one atomic bundle without ever dropping the payment, and
- * without adding a second mempool nonce that would push the payment out of the
- * top-of-block region.
+ * allowed-to-revert and is not part of the immediate public prefix. This lets an
+ * execution revert be tolerated by builders without making optional offense a
+ * prerequisite for submitting the payment.
  */
 async function queueAuditPlan(
   plan: PreBoundaryAuditPlan,
   targetEpoch: bigint,
   boundaryTs: bigint,
-  opts: { revertible: boolean },
+  opts: { revertible: boolean; deadlineMs?: number },
 ): Promise<void> {
   const { auditors, statuses, owned, pinned } = plan;
   let idx = 0;
   for (const t of statuses) {
     if (idx >= auditors.length) break;
+    if (opts.revertible && idx >= MAX_RIDE_AUDITS) break;
+    if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) {
+      logger.warn("pre-boundary audit attach window closed; submitting the payment bundle now");
+      break;
+    }
     if (owned.has(t.tokenId)) continue;
     if (pinned && !pinned.has(t.tokenId)) continue;
     if (t.auditDueTimestamp !== "0") continue; // already under audit
     if (!isAuditable(BigInt(t.lastEpochPaid), targetEpoch)) continue; // won't be auditable at the boundary
-    const guard = await canSpend(AUDIT_COST_WEI, true);
+    const guardOutcome = opts.deadlineMs === undefined
+      ? { timedOut: false as const, value: await canSpend(AUDIT_COST_WEI, true) }
+      : await settleBeforeDeadline(canSpend(AUDIT_COST_WEI, true), opts.deadlineMs);
+    if (guardOutcome.timedOut) {
+      logger.warn("pre-boundary audit spend check missed its attach deadline; submitting the payment bundle now");
+      break;
+    }
+    const guard = guardOutcome.value;
     if (!guard.ok) continue;
+    if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) {
+      logger.warn("pre-boundary audit attach window closed after spend checks; submitting the payment bundle now");
+      break;
+    }
     const from = auditors[idx]!;
     const res = await act(
       { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
@@ -475,6 +812,7 @@ async function queueAuditPlan(
         race: true,
         simTimestamp: boundaryTs,
         revertible: opts.revertible,
+        deadlineMs: opts.deadlineMs,
       },
     );
     if (res?.ok) idx++;
@@ -488,7 +826,7 @@ async function queuePreBoundaryAudits(
   targetEpoch: bigint,
   nowSec: bigint,
   boundaryTs: bigint,
-  opts: { revertible: boolean },
+  opts: { revertible: boolean; deadlineMs?: number },
 ): Promise<void> {
   const plan = await prefetchPreBoundaryAuditTargets(address, targetEpoch, nowSec);
   if (plan) await queueAuditPlan(plan, targetEpoch, boundaryTs, opts);
@@ -499,13 +837,16 @@ async function queuePreBoundaryAudits(
  *  later. Standalone (no payment this boundary): its own bundle, mirrored per
  *  racePublicMempool. When a payment IS armed for this boundary, firePreBoundaryPay
  *  carries the audits instead (see schedulePreBoundaryAudit). */
-async function firePreBoundaryAudit(): Promise<void> {
+async function firePreBoundaryAudit(generation = engineGeneration): Promise<void> {
   const s = runtime.strategy;
+  if (!executionIsCurrent(generation)) return;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
-  if (ticking) { setTimeout(() => void firePreBoundaryAudit(), 150); return; }
+  if (ticking) { setTimeout(() => void firePreBoundaryAudit(generation), 150); return; }
+  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
+  executingGeneration = generation;
   committedThisTickWei = 0n;
   beginBatch();
   const address = runtime.account.address;
@@ -520,9 +861,9 @@ async function firePreBoundaryAudit(): Promise<void> {
     logger.error("pre-boundary audit error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
   } finally {
-    await flushBatch();
+    await flushOrDiscardBatch(generation);
     nonceManager.reset();
-    ticking = false;
+    finishExclusive(generation);
   }
 }
 
@@ -535,26 +876,45 @@ export function schedulePreBoundaryKill(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
   if (nextKillDeadlineSec === null) return;
+  const targetDeadline = nextKillDeadlineSec;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(nextKillDeadlineSec - nowSec) * 1000 - effectiveLeadMs();
-  if (deltaMs <= 0) return; // too late; normal offense kills it right after expiry
-  preBoundaryKillTimer = setTimeout(() => void firePreBoundaryKill(), Math.min(deltaMs, 2_000_000_000));
+  const deltaMs = Number(targetDeadline - nowSec) * 1000 - effectiveLeadMs();
+  const generation = engineGeneration;
+  if (deltaMs <= 0) {
+    if (targetDeadline > nowSec) {
+      preBoundaryKillTimer = setTimeout(
+        () => void firePreBoundaryKill(generation, targetDeadline),
+        0,
+      );
+    }
+    return; // already expired => normal offense handles it
+  }
+  const maxTimerDelayMs = 2_000_000_000;
+  preBoundaryKillTimer = deltaMs > maxTimerDelayMs
+    ? setTimeout(schedulePreBoundaryKill, maxTimerDelayMs)
+    : setTimeout(() => void firePreBoundaryKill(generation, targetDeadline), deltaMs);
 }
 
 /** Pre-submit kills (skip-sim) for targets whose audit is about to expire, so the
  *  kill lands in the first eligible block instead of the one after. */
-async function firePreBoundaryKill(): Promise<void> {
+async function firePreBoundaryKill(
+  generation = engineGeneration,
+  targetDeadline: bigint | null = nextKillDeadlineSec,
+): Promise<void> {
   const s = runtime.strategy;
+  if (!executionIsCurrent(generation)) return;
   if (!s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
-  if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
+  if (ticking) { setTimeout(() => void firePreBoundaryKill(generation, targetDeadline), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
+  executingGeneration = generation;
   committedThisTickWei = 0n;
   beginBatch();
   const address = runtime.account.address;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  let followingDeadline: bigint | null = null;
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
   const windowSec = BigInt(Math.ceil(effectiveLeadMs() / 1000) + 12);
   try {
@@ -566,12 +926,26 @@ async function firePreBoundaryKill(): Promise<void> {
     const owned = new Set(ownedIds.map((x) => x.toString()));
     const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
     const statuses = await batchGetTargetStatuses(live, runtime.currentEpoch ?? 0n, nowSec);
-    for (const t of statuses) {
-      if (owned.has(t.tokenId)) continue;
-      if (pinned && !pinned.has(t.tokenId)) continue;
+    const imminent = statuses.flatMap((t) => {
+      if (owned.has(t.tokenId)) return [];
+      if (pinned && !pinned.has(t.tokenId)) return [];
       const due = BigInt(t.auditDueTimestamp);
-      if (due === 0n || t.killable) continue; // not under audit, or already killable (normal path handles it)
-      if (due <= nowSec || due - nowSec > windowSec) continue; // not imminent
+      if (due === 0n || t.killable || due <= nowSec || due - nowSec > windowSec) return [];
+      if (targetDeadline !== null && due < targetDeadline) return [];
+      return [{ target: t, due }];
+    });
+    const earliestDue = imminent.reduce<bigint | null>(
+      (earliest, item) => earliest === null || item.due < earliest ? item.due : earliest,
+      null,
+    );
+    followingDeadline = imminent.reduce<bigint | null>((next, item) => {
+      if (earliestDue === null || item.due <= earliestDue) return next;
+      return next === null || item.due < next ? item.due : next;
+    }, null);
+    // A bundle has one execution timestamp. Batch only the earliest-deadline
+    // cohort; mixing due+1 timestamps would invalidate and discard every kill.
+    for (const { target: t, due } of imminent) {
+      if (due !== earliestDue) continue;
       const guard = await canSpend(0n, true);
       if (!guard.ok) continue;
       await act(
@@ -585,9 +959,13 @@ async function firePreBoundaryKill(): Promise<void> {
     logger.error("pre-boundary kill error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary kill error: ${(err as Error).message}` });
   } finally {
-    await flushBatch();
+    await flushOrDiscardBatch(generation);
     nonceManager.reset();
-    ticking = false;
+    finishExclusive(generation);
+    if (executionIsCurrent(generation) && followingDeadline !== null) {
+      nextKillDeadlineSec = followingDeadline;
+      schedulePreBoundaryKill();
+    }
   }
 }
 
@@ -634,39 +1012,8 @@ export function scheduleOffenseBoundary(): void {
     return;
   }
   const delayMs = Math.min(deltaMs, 2_000_000_000);
-  offenseBoundaryTimer = setTimeout(() => fireBoundaryTick(false), delayMs);
-}
-
-// Lead time before the next epoch boundary at which we fire the proactive-pay
-// tick, so the tx is built and broadcast right as the new epoch begins instead
-// of waiting for the next lazy poll/block tick to notice.
-const DEFENSE_LEAD_MS = 1_500;
-
-/**
- * Arm a precise tick at the next epoch boundary to run proactive-pay. Proactive
- * pay never fires from a regular tick — only from this boundary-timed one — so
- * an already-delinquent citizen is left alone until the *next* epoch rolls,
- * then paid as fast as possible rather than instantly on detection.
- */
-export function scheduleDefenseBoundary(): void {
-  if (defenseBoundaryTimer) {
-    clearTimeout(defenseBoundaryTimer);
-    defenseBoundaryTimer = null;
-  }
-  const s = runtime.strategy;
-  if (!runtime.running || !s.enabled || !s.proactivePay) return;
-  if (runtime.startTime === null || runtime.currentEpoch === null) return;
-
-  // Epoch boundary that starts epoch (current+1) is startTime + current*DURATION.
-  const nextEpochBoundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS;
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(nextEpochBoundary - nowSec) * 1000 - DEFENSE_LEAD_MS;
-  if (deltaMs <= 0) {
-    void tick(true);
-    return;
-  }
-  const delayMs = Math.min(deltaMs, 2_000_000_000);
-  defenseBoundaryTimer = setTimeout(() => fireBoundaryTick(true), delayMs);
+  const generation = engineGeneration;
+  offenseBoundaryTimer = setTimeout(() => fireBoundaryTick(generation), delayMs);
 }
 
 async function refreshSnapshot(address: Address): Promise<void> {
@@ -689,13 +1036,16 @@ async function refreshSnapshot(address: Address): Promise<void> {
   scheduleJitBoundary();
   schedulePreBoundaryPay();
   schedulePreBoundaryAudit();
-  scheduleDefenseBoundary();
 }
 
 /** Pre-flight guardrail: can we afford this spend without breaching caps/floors?
  *  `offense` selects the audit/kill gas profile so the base-fee cap and gas
  *  estimate match what `submitTx` will actually bid. */
-async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boolean; reason?: string }> {
+async function canSpend(
+  valueWei: bigint,
+  offense: boolean,
+  replacement?: PaymentFlight,
+): Promise<{ ok: boolean; reason?: string }> {
   const s = runtime.strategy;
   const gas = resolveGas(s, offense);
   const block = await getLatestBlockCached();
@@ -717,7 +1067,21 @@ async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boole
     }
   }
 
-  const gasWei = GAS_GUESS * (baseFee * 2n + BigInt(Math.round(gas.priorityFeeGwei * 1e9)));
+  let priorityFee = BigInt(Math.round(effectiveTipGwei(gas, block.gasUsed, block.gasLimit) * 1e9));
+  let maxFeePerGas = baseFee * 2n + priorityFee;
+  if (replacement) {
+    const fees = cappedReplacementFees(
+      maxFeePerGas,
+      priorityFee,
+      replacement.maxFeePerGas,
+      replacement.maxPriorityFeePerGas,
+      gas,
+    );
+    if (!fees) return { ok: false, reason: "replacement fee ceiling reached" };
+    priorityFee = fees.maxPriorityFeePerGas;
+    maxFeePerGas = fees.maxFeePerGas;
+  }
+  const gasWei = GAS_GUESS * maxFeePerGas;
 
   const bal = runtime.balanceWei ?? 0n;
   const floor = parseEther(String(s.minBalanceEth));
@@ -742,7 +1106,11 @@ const RECEIPT_TIMEOUT_MS = 3 * 60_000;
  * never awaited by the tick loop, and swallows errors/timeouts so a stuck poll
  * can't wedge the engine.
  */
-async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<void> {
+async function trackReceipt(
+  entryId: string,
+  txHash: `0x${string}`,
+  receiptFlight?: PaymentFlight,
+): Promise<void> {
   try {
     const receipt = await publicClient.waitForTransactionReceipt({
       hash: txHash,
@@ -753,19 +1121,184 @@ async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<voi
       status: receipt.status === "success" ? "included" : "reverted",
       targetBlock: block,
     });
+    if (receiptFlight) {
+      const current = paymentFlights.get(receiptFlight.tokenId);
+      // Every alternative signed with this nonce is terminal once any one of
+      // them mines. Never resurrect a flight cleared by an account switch, and
+      // preserve the current replacement's obligations if an older hash wins.
+      if (
+        current
+        && current.account === receiptFlight.account
+        && current.nonce === receiptFlight.nonce
+      ) {
+        if (receipt.status === "success") {
+          current.delivery = "included";
+        } else {
+          clearSourceMarker(current);
+          paymentFlights.delete(receiptFlight.tokenId);
+        }
+      }
+    }
   } catch (err) {
     // Timed out or RPC error — leave the entry as "submitted".
     logger.warn(`receipt tracking for ${txHash.slice(0, 10)}… failed: ${(err as Error).message}`);
   }
 }
 
+interface PaymentActContext {
+  expectedLastEpochPaid: bigint;
+  source: PaymentSource;
+  replace?: PaymentFlight;
+  jitTargetEpoch?: number;
+  proactiveEpoch?: bigint;
+  reserveProactiveMarker?: boolean;
+}
+
+function pendingPaymentFor(tokenId: string, observedLastEpochPaid: bigint): PaymentFlight | undefined {
+  const flight = paymentFlights.get(tokenId);
+  if (!flight) return undefined;
+  if (observedLastEpochPaid >= flight.expectedLastEpochPaid) {
+    if (
+      flight.jitTargetEpoch !== null
+      && runtime.strategy.jitEnabled
+      && runtime.strategy.jitTargetEpoch === flight.jitTargetEpoch
+    ) {
+      prepareJitBookkeeping();
+      if (jitSubmittedTarget === flight.jitTargetEpoch) jitSubmitted.add(tokenId);
+    }
+    if (flight.proactiveEpoch !== null && runtime.currentEpoch === flight.proactiveEpoch) {
+      if (proactivePaySubmittedEpoch !== flight.proactiveEpoch) {
+        proactivePaySubmittedEpoch = flight.proactiveEpoch;
+        proactivePaySubmitted = new Set();
+      }
+      proactivePaySubmitted.add(tokenId);
+    }
+    paymentFlights.delete(tokenId);
+    return undefined;
+  }
+  return flight;
+}
+
+/** Reconcile payment flights at one explicit block. A receipt watcher can time
+ * out, and another wallet transaction (or a reverted payment) can consume the
+ * nonce without advancing lastEpochPaid. Once the confirmed nonce is beyond a
+ * flight, stale tax state proves the flight is terminal and the next pass must
+ * use a fresh nonce instead of replacing an impossible one forever. */
+async function reconcilePaymentFlights(address: Address): Promise<void> {
+  const flights = [...paymentFlights.values()].filter((flight) => flight.account === address);
+  if (flights.length === 0) return;
+  const blockNumber = runtime.lastBlock;
+  try {
+    const [confirmedNonce, results] = await Promise.all([
+      blockNumber === null
+        ? publicClient.getTransactionCount({ address, blockTag: "latest" })
+        : publicClient.getTransactionCount({ address, blockNumber }),
+      publicClient.multicall({
+        allowFailure: true,
+        contracts: flights.map((flight) => ({
+          ...gameContract,
+          functionName: "lastEpochPaid" as const,
+          args: [BigInt(flight.tokenId)] as const,
+        })),
+        ...(blockNumber === null ? {} : { blockNumber }),
+      }),
+    ]);
+    for (let i = 0; i < flights.length; i++) {
+      const snapshot = flights[i]!;
+      const current = paymentFlights.get(snapshot.tokenId);
+      if (!current || current.attemptId !== snapshot.attemptId) continue;
+      const result = results[i];
+      if (result?.status !== "success") continue;
+      const observed = result.result as bigint;
+      if (observed >= current.expectedLastEpochPaid) {
+        pendingPaymentFor(current.tokenId, observed);
+      } else if (confirmedNonce > current.nonce) {
+        clearSourceMarker(current);
+        paymentFlights.delete(current.tokenId);
+        activity.add({
+          kind: "info",
+          status: "info",
+          tokenId: current.tokenId,
+          message: `Payment nonce ${current.nonce} was consumed without advancing #${current.tokenId}; retrying with fresh chain state`,
+        });
+      } else if (
+        Date.now() - current.submittedAtMs >= 90_000
+        && !nonceManager.hasInvisibleReservation()
+        && nonceManager.pendingNonce() <= current.nonce
+      ) {
+        // The latest replacement has aged past the nonce manager's reservation
+        // window, is neither confirmed nor visible in this node's pending state,
+        // and any private bundle targeted only the next two blocks. Clear the
+        // flight so the next safety pass reuses this same on-chain nonce from
+        // fresh state—even after fee bumps reached their configured ceiling.
+        clearSourceMarker(current);
+        paymentFlights.delete(current.tokenId);
+        activity.add({
+          kind: "info",
+          status: "info",
+          tokenId: current.tokenId,
+          message: `Payment nonce ${current.nonce} is no longer pending; retrying #${current.tokenId} without exceeding the fee ceiling`,
+        });
+      }
+    }
+  } catch (err) {
+    // Retain the existing flight and let the ordinary safety passes continue;
+    // this check is retried on the next tick.
+    logger.warn("payment-flight reconciliation failed:", (err as Error).message);
+  }
+}
+
+const PAYMENT_REPLACEMENT_AFTER_MS = 30_000;
+
+function replacementDue(flight: PaymentFlight, requiredValueWei: bigint, urgent: boolean): boolean {
+  if (flight.delivery === "queued") return false;
+  if (urgent && (requiredValueWei !== flight.valueWei || flight.source !== "defense")) return true;
+  return Date.now() - flight.submittedAtMs >= PAYMENT_REPLACEMENT_AFTER_MS;
+}
+
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean },
+  ctx: {
+    tokenId?: string;
+    targetTokenId?: string;
+    message: string;
+    race?: boolean;
+    simTimestamp?: bigint;
+    revertible?: boolean;
+    /** Optional absolute cutoff for best-effort work riding a survival bundle. */
+    deadlineMs?: number;
+    payment?: PaymentActContext;
+  },
 ): Promise<SubmitResult | null> {
   const dryRun = runtime.strategy.dryRun;
   const offense = kind === "audit" || kind === "kill";
+  if (
+    executingGeneration === null
+    || !executionIsCurrent(executingGeneration)
+  ) {
+    activity.add({
+      kind: "info",
+      status: "skipped",
+      tokenId: ctx.tokenId,
+      targetTokenId: ctx.targetTokenId,
+      message: `${ctx.message} — cancelled because the engine stopped`,
+    });
+    return null;
+  }
+  if (
+    nonceManager.hasInvisibleReservation()
+    && !ctx.payment?.replace
+  ) {
+    activity.add({
+      kind: "info",
+      status: "skipped",
+      tokenId: ctx.tokenId,
+      targetTokenId: ctx.targetTokenId,
+      message: `${ctx.message} — waiting for a prior unacknowledged nonce to land or expire`,
+    });
+    return null;
+  }
   try {
     const result = await submitTx(intent, {
       dryRun,
@@ -773,17 +1306,35 @@ async function act(
       // slot — so PAYMENTS always mirror to the public mempool as a fallback: one
       // that never lands can cost a citizen, and a tax payment isn't meaningfully
       // front-runnable (rivals already see the delinquency on-chain).
-      // OFFENSE stays opt-in (racePublicMempool): a visible pending audit lets the
-      // target escape by paying first, so privacy is worth something there.
       // A `revertible` tx (an audit riding behind a payment in one bundle) never
       // mirrors — the whole point is to keep the shared-nonce mempool sequence
       // clean so the payment still wins top-of-block.
-      race: ctx.revertible ? false : offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
+      // OFFENSE stays opt-in (racePublicMempool) when offense runs alone. While
+      // survival automation is active it also gets a public fallback: otherwise
+      // a private-only offense nonce can invisibly fence an emergency payment.
+      race: ctx.revertible
+        ? false
+        : offense
+          ? Boolean(ctx.race && (
+              runtime.strategy.racePublicMempool
+              || runtime.strategy.enabled
+              || runtime.strategy.jitEnabled
+            ))
+          : true,
       offense,
       simTimestamp: ctx.simTimestamp,
       revertible: ctx.revertible,
+      deadlineMs: ctx.deadlineMs,
+      signal: engineAbortController?.signal,
+      replacement: ctx.payment?.replace
+        ? {
+            nonce: ctx.payment.replace.nonce,
+            priorMaxFeePerGas: ctx.payment.replace.maxFeePerGas,
+            priorMaxPriorityFeePerGas: ctx.payment.replace.maxPriorityFeePerGas,
+          }
+        : undefined,
     });
-    if (!result.ok) {
+    if (!result.ok && !result.uncertain) {
       activity.add({
         kind,
         status: result.simulated ? "reverted" : "skipped",
@@ -794,10 +1345,44 @@ async function act(
       });
       return result;
     }
-    if (!dryRun) runtime.recordSpend(result.valueWei + result.gasWei);
+    if (!dryRun) {
+      const total = result.valueWei + result.gasWei;
+      const prior = ctx.payment?.replace;
+      const priorTotal = prior ? prior.valueWei + prior.gasWei : 0n;
+      // Same-nonce alternatives are mutually exclusive. Count only the extra
+      // worst-case liability instead of presenting every replacement as a second
+      // full payment in spend telemetry.
+      runtime.recordSpend(total > priorTotal ? total - priorTotal : 0n);
+    }
     // Count it against this tick's budget so later canSpend checks in the same
     // tick see the reduced headroom (applies in dry-run too, to simulate faithfully).
     committedThisTickWei += result.valueWei + result.gasWei;
+    let paymentFlight: PaymentFlight | undefined;
+    let previousPaymentFlight: PaymentFlight | undefined;
+    if (!dryRun && kind === "pay-taxes" && ctx.tokenId !== undefined && ctx.payment) {
+      previousPaymentFlight = paymentFlights.get(ctx.tokenId);
+      paymentFlight = {
+        attemptId: ++nextPaymentAttemptId,
+        account: runtime.account!.address,
+        tokenId: ctx.tokenId,
+        expectedLastEpochPaid: ctx.payment.expectedLastEpochPaid,
+        nonce: result.nonce,
+        valueWei: result.valueWei,
+        gasWei: result.gasWei,
+        maxFeePerGas: result.maxFeePerGas ?? 0n,
+        maxPriorityFeePerGas: result.maxPriorityFeePerGas ?? 0n,
+        txHash: result.txHash,
+        source: ctx.payment.source,
+        jitTargetEpoch: ctx.payment.jitTargetEpoch ?? previousPaymentFlight?.jitTargetEpoch ?? null,
+        proactiveEpoch: ctx.payment.proactiveEpoch ?? previousPaymentFlight?.proactiveEpoch ?? null,
+        proactiveMarkerReserved:
+          Boolean(ctx.payment.reserveProactiveMarker)
+          || Boolean(previousPaymentFlight?.proactiveMarkerReserved),
+        submittedAtMs: Date.now(),
+        delivery: result.queued ? "queued" : "submitted",
+      };
+      paymentFlights.set(ctx.tokenId, paymentFlight);
+    }
     const entry = activity.add({
       kind,
       status: dryRun ? "dry-run" : "submitted",
@@ -814,13 +1399,22 @@ async function act(
     // Queued into a bundle batch (mainnet): the tx isn't sent yet, so its hashes
     // and receipt tracking are reconciled by flushBatch at end of tick.
     if (result.queued) {
-      batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+      batchEntries.push({
+        entryId: entry.id,
+        nonce: result.nonce,
+        message: ctx.message,
+        paymentAttemptId: paymentFlight?.attemptId,
+        paymentTokenId: paymentFlight?.tokenId,
+        previousPaymentFlight,
+      });
       return result;
     }
     // Watch for the receipt so the entry flips submitted -> included/reverted.
     // Only public-mempool submissions expose a tx hash; pure Flashbots bundles
     // (bundleHash only) stay "submitted" since there's nothing to poll.
-    if (!dryRun && result.txHash) void trackReceipt(entry.id, result.txHash);
+    if (!dryRun && result.txHash) {
+      void trackReceipt(entry.id, result.txHash, paymentFlight);
+    }
     return result;
   } catch (err) {
     activity.add({
@@ -846,6 +1440,8 @@ async function defensePass(
   const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, epochs);
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
+    const lastEpochPaid = BigInt(st.lastEpochPaid);
+    const pending = pendingPaymentFor(st.tokenId, lastEpochPaid);
     const underAudit = st.auditDueTimestamp !== "0";
     const bribes = BigInt(st.bribeBalance);
 
@@ -854,7 +1450,7 @@ async function defensePass(
       // Only spend a bribe if the user opted in — a bribe clears the audit for free
       // but is consumed and leaves the token delinquent (re-auditable), so by
       // default we pay taxes to clear instead and never auto-consume bribes.
-      if (s.autoUseBribe && bribes > 0n) {
+      if (!pending && s.autoUseBribe && bribes > 0n) {
         // Bribe is free (value 0) but still costs gas — apply the same guardrail
         // as the pay-to-clear path below so the base-fee cap holds consistently.
         const guard = await canSpend(0n, false);
@@ -870,7 +1466,8 @@ async function defensePass(
         continue;
       }
       const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
-      const guard = await canSpend(value, false);
+      if (pending && !replacementDue(pending, value, true)) continue;
+      const guard = await canSpend(value, false, pending);
       if (!guard.ok) {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer pay #${st.tokenId}: ${guard.reason}` });
         continue;
@@ -878,7 +1475,15 @@ async function defensePass(
       await act(
         { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, epochs), value },
         "pay-taxes",
-        { tokenId: st.tokenId, message: `Pay taxes on audited #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
+        {
+          tokenId: st.tokenId,
+          message: `${pending ? "Replace pending payment and clear" : "Pay taxes on"} audited #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH`,
+          payment: {
+            expectedLastEpochPaid: lastEpochPaid + BigInt(epochs),
+            source: "defense",
+            replace: pending,
+          },
+        },
       );
       continue;
     }
@@ -886,10 +1491,8 @@ async function defensePass(
 }
 
 /**
- * Pay delinquent-but-not-yet-audited citizens. Only invoked from the
- * boundary-timed tick armed by `scheduleDefenseBoundary` (see DEFENSE_LEAD_MS),
- * never from a regular poll/block tick — so a citizen that's already delinquent
- * is left alone until the next epoch boundary, then paid immediately.
+ * Pay delinquent-but-not-yet-audited citizens. This runs on every tick as the
+ * reliable fallback when a pre-boundary tax-skip payment was missed or lost.
  */
 async function proactivePayPass(
   ownedIds: bigint[],
@@ -908,24 +1511,40 @@ async function proactivePayPass(
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const key = st.tokenId;
-    if (proactivePaySubmitted.has(key)) continue;
+    const lastEpochPaid = BigInt(st.lastEpochPaid);
+    const pending = pendingPaymentFor(key, lastEpochPaid);
 
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
 
     const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
     if (value === 0n) continue;
-    const guard = await canSpend(value, false);
+    if (pending && !replacementDue(pending, value, false)) continue;
+    if (!pending && proactivePaySubmitted.has(key)) continue;
+    const guard = await canSpend(value, false, pending);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
       continue;
     }
-    proactivePaySubmitted.add(key); // mark before awaiting so a rapid re-fire can't double-submit
-    await act(
+    proactivePaySubmitted.add(key); // reserve locally while the async submission is in flight
+    const res = await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, epochs), value },
       "pay-taxes",
-      { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
+      {
+        tokenId: st.tokenId,
+        message: `${pending ? "Replace pending" : "Proactive"} pay #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH`,
+        payment: {
+          expectedLastEpochPaid: lastEpochPaid + BigInt(epochs),
+          source: "proactive",
+          replace: pending,
+          proactiveEpoch: currentEpoch,
+          reserveProactiveMarker: true,
+        },
+      },
     );
+    if ((!res || (!res.ok && !res.uncertain)) && !pending) {
+      proactivePaySubmitted.delete(key); // a definite failed first send must be retryable next tick
+    }
   }
 }
 
@@ -944,23 +1563,21 @@ async function jitPass(
   const target = s.jitTargetEpoch;
   if (Number(currentEpoch) < target) return; // target epoch hasn't begun yet
 
-  // Reset bookkeeping if the target changed.
-  if (jitSubmittedTarget !== target) {
-    jitSubmitted = new Set();
-    jitSubmittedTarget = target;
-  }
+  prepareJitBookkeeping();
 
-  const selected = s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds;
+  const selected = selectedOwnedJitTokenIds(ownedIds);
   if (selected.length === 0) return; // nothing owned yet — stay armed
 
   const statuses = await batchGetOwnedStatuses(selected, currentEpoch, nowSec, 1);
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const key = st.tokenId;
+    const lastEpochPaid = BigInt(st.lastEpochPaid);
+    const pending = pendingPaymentFor(key, lastEpochPaid);
     if (jitSubmitted.has(key)) continue;
 
-    if (BigInt(st.lastEpochPaid) >= currentEpoch) {
-      jitSubmitted.add(key); // already current for this epoch
+    if (lastEpochPaid >= currentEpoch) {
+      jitSubmitted.add(key); // confirmed current for this epoch
       continue;
     }
     // JIT pays exactly one epoch — one day — which advances the citizen a single
@@ -973,7 +1590,8 @@ async function jitPass(
       jitSubmitted.add(key);
       continue;
     }
-    const guard = await canSpend(value, false);
+    if (pending && !replacementDue(pending, value, false)) continue;
+    const guard = await canSpend(value, false, pending);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer JIT pay #${key}: ${guard.reason}` });
       continue; // retry next tick — do not mark submitted
@@ -981,9 +1599,20 @@ async function jitPass(
     const res = await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, 1), value },
       "pay-taxes",
-      { tokenId: key, message: `JIT pay #${key} for epoch ${currentEpoch} = ${formatEther(value)} ETH` },
+      {
+        tokenId: key,
+        message: `${pending ? "Replace pending JIT" : "JIT"} pay #${key} for epoch ${currentEpoch} = ${formatEther(value)} ETH`,
+        payment: {
+          expectedLastEpochPaid: lastEpochPaid + 1n,
+          source: "jit",
+          replace: pending,
+          jitTargetEpoch: target,
+        },
+      },
     );
-    if (res) jitSubmitted.add(key);
+    // Stay armed until a fresh on-chain read confirms lastEpochPaid advanced.
+    // A relay/bundle acknowledgement is delivery, not inclusion.
+    if (!res || (!res.ok && !res.uncertain)) continue;
   }
 
   // One-shot: disarm once every selected token has been submitted/covered.
@@ -1124,13 +1753,11 @@ async function offensePass(
   schedulePreBoundaryKill();
 }
 
-// `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary
-// at the next epoch boundary — every other tick (block watch, poll, JIT/offense
-// boundary ticks) leaves already-delinquent citizens alone.
-async function tick(fireProactivePay = false): Promise<void> {
+async function tick(generation = engineGeneration): Promise<void> {
   if (ticking) return;
-  if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (!executionIsCurrent(generation) || !runtime.unlocked || !runtime.account) return;
   ticking = true;
+  executingGeneration = generation;
   committedThisTickWei = 0n; // fresh spend budget for this tick
   beginBatch();
   const address = runtime.account.address;
@@ -1150,21 +1777,37 @@ async function tick(fireProactivePay = false): Promise<void> {
     const currentEpoch = runtime.currentEpoch ?? 0n;
 
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+    await reconcilePaymentFlights(address);
 
     if (runtime.strategy.enabled) {
+      prepareJitBookkeeping();
       await defensePass(ownedIds, currentEpoch, nowSec);
-      if (fireProactivePay && runtime.strategy.proactivePay) {
+      if (runtime.strategy.proactivePay) {
         await proactivePayPass(ownedIds, currentEpoch, nowSec);
       }
-      await jitPass(ownedIds, currentEpoch, nowSec);
     }
+    // JIT is independently armable through the config API and must continue even
+    // when continuous defense is disabled.
+    await jitPass(ownedIds, currentEpoch, nowSec);
+
+    // Survival payments and best-effort offense must never share one atomic
+    // bundle: a raced/stale audit or kill can legitimately revert and must not
+    // suppress otherwise-valid defensive payments.
+    if (!executionIsCurrent(generation)) return;
+    await flushBatch();
+    if (!executionIsCurrent(generation)) return;
+    // A payment nonce that has not yet advanced on-chain is a hard fence for
+    // best-effort offense. Deferring offense avoids constructing a second private
+    // bundle above that nonce (which cannot execute independently).
+    if (appConfig.mode === "mainnet" && paymentFlights.size > 0) return;
+    beginBatch();
     await offensePass(ownedIds, currentEpoch, nowSec);
   } catch (err) {
     logger.error("tick error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Tick error: ${(err as Error).message}` });
   } finally {
-    await flushBatch();
+    await flushOrDiscardBatch(generation);
     nonceManager.reset();
-    ticking = false;
+    finishExclusive(generation);
   }
 }

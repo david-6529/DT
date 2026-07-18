@@ -1,7 +1,7 @@
 {
   "enabled": false,
   "dryRun": true,
-  "auditSafetyBufferSeconds": 10800,
+  "auditSafetyBufferSeconds": 86400,
   "proactivePay": true,
   "prepayEpochs": 1,
   "autoUseBribe": false,

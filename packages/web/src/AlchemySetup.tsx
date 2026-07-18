@@ -31,7 +31,8 @@ export function AlchemySetup({ onSaved }: Props) {
         This bot needs an <b>Alchemy API key</b> to read on-chain data and submit
         transactions. Create a free key at{" "}
         <span className="mono">alchemy.com</span>, then paste it below.
-        Your key is stored locally and never leaves this machine.
+        Your key is stored locally and is sent only as part of requests to the
+        configured Alchemy endpoints.
       </div>
       <div className="spacer" />
 

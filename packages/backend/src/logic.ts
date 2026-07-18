@@ -34,6 +34,37 @@ export function resolveGas(s: StrategyConfig, offense: boolean): GasSettings {
   };
 }
 
+/** Strictly exceed the common 12.5% txpool replacement threshold. The trailing
+ * +1 matters when `previous` is exactly divisible by eight. */
+export function nextReplacementFee(previous: bigint): bigint {
+  return (previous * 9n) / 8n + 1n;
+}
+
+/** Resolve a same-nonce replacement while honoring the operator's existing gas
+ * ceilings. Returns null once either EIP-1559 field would exceed those ceilings,
+ * preventing an unmined transaction from compounding fees without bound. */
+export function cappedReplacementFees(
+  currentMaxFeePerGas: bigint,
+  currentMaxPriorityFeePerGas: bigint,
+  priorMaxFeePerGas: bigint,
+  priorMaxPriorityFeePerGas: bigint,
+  gas: GasSettings,
+): { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null {
+  const priorityCap = BigInt(Math.round(Math.max(
+    gas.priorityFeeGwei,
+    gas.dynamicTipMaxGwei,
+  ) * 1e9));
+  const maxFeeCap = BigInt(Math.round(2 * gas.maxBaseFeeGwei * 1e9)) + priorityCap;
+  const bumpedMax = nextReplacementFee(priorMaxFeePerGas);
+  const bumpedPriority = nextReplacementFee(priorMaxPriorityFeePerGas);
+  const maxFeePerGas = currentMaxFeePerGas > bumpedMax ? currentMaxFeePerGas : bumpedMax;
+  const maxPriorityFeePerGas = currentMaxPriorityFeePerGas > bumpedPriority
+    ? currentMaxPriorityFeePerGas
+    : bumpedPriority;
+  if (maxFeePerGas > maxFeeCap || maxPriorityFeePerGas > priorityCap) return null;
+  return { maxFeePerGas, maxPriorityFeePerGas };
+}
+
 /** A token is auditable once it is >= 2 epochs behind (matches contract `_audit`). */
 export function isAuditable(lastEpochPaid: bigint, currentEpoch: bigint): boolean {
   return lastEpochPaid + 2n <= currentEpoch;
